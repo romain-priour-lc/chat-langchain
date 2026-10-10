@@ -2,7 +2,8 @@
 
 These were previously enforced in ``src/api/auth.py`` (``validate_inputs``).
 Under MDA, identity/thread scoping is declared in ``identity.py``; this
-middleware only caps oversized user input.
+middleware caps oversized user input and ends runs for re-sent turns that
+already have a final answer.
 
 Trace metadata (prompt provenance, ``LANGSMITH_AGENT_VERSION``, ``source_type``)
 is applied at agent compile time via ``define_deep_agent(metadata=...)`` in
@@ -14,23 +15,34 @@ not synthesized; archive deploys use ``LANGSMITH_HOST_REVISION_ID`` /
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from langchain.agents.middleware import AgentMiddleware, AgentState
+from langchain.agents.middleware import AgentMiddleware, AgentState, hook_config
 from langgraph.runtime import Runtime
+
+logger = logging.getLogger(__name__)
 
 #: Upper bound on user-provided text, matching the previous ``MAX_MESSAGE_CHARS``.
 MAX_MESSAGE_CHARS = 50_000
 
 
 class IngressGuardsMiddleware(AgentMiddleware):
-    """Cap oversized user input at agent ingress."""
+    """Cap oversized user input and skip already-answered turns at agent ingress."""
 
+    @hook_config(can_jump_to=["end"])
     def before_agent(
         self, state: AgentState, runtime: Runtime
     ) -> dict[str, Any] | None:
-        """Truncate the latest user message when it exceeds the size cap."""
+        """End re-sent answered turns, else truncate the latest oversized user message."""
         messages = state.get("messages", [])
+        if self._latest_turn_answered(messages):
+            # A client re-send with the same message id is replaced in place by
+            # the messages reducer, leaving the thread ending in an AI answer.
+            logger.warning(
+                "Latest human turn already answered; ending run without a model call."
+            )
+            return {"jump_to": "end"}
         for message in reversed(messages):
             if getattr(message, "type", None) == "human":
                 capped = self._truncate_content(message.content)
@@ -40,6 +52,15 @@ class IngressGuardsMiddleware(AgentMiddleware):
                     return {"messages": [message]}
                 break
         return None
+
+    def _latest_turn_answered(self, messages: list[Any]) -> bool:
+        """Return True when a final AI answer follows the newest human message."""
+        if not messages:
+            return False
+        last = messages[-1]
+        if getattr(last, "type", None) != "ai" or getattr(last, "tool_calls", None):
+            return False
+        return any(getattr(m, "type", None) == "human" for m in messages[:-1])
 
     def _truncate_content(self, content: Any) -> Any:
         """Trim user text to the cap while preserving non-text content blocks."""
