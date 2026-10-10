@@ -32,6 +32,16 @@ RETRYABLE_ERROR_MARKERS = (
     "too many requests",
 )
 
+# Some tools (e.g. the docs MCP server) report upstream failures as normal output
+# such as "Search failed: 504 Gateway Time-out" instead of raising.
+CONTENT_FAILURE_PATTERN = re.compile(
+    r"^[^\n]{0,80}\bfailed:\s*(?:429|5\d\d)\b",
+    re.IGNORECASE,
+)
+
+# Each content-level failure can already cost a full upstream timeout, so retry once.
+CONTENT_FAILURE_MAX_ATTEMPTS = 2
+
 
 class ToolRetryMiddleware(AgentMiddleware[AgentState]):
     """Retry transient tool failures and return model-readable errors."""
@@ -90,6 +100,23 @@ class ToolRetryMiddleware(AgentMiddleware[AgentState]):
 
         return any(marker in text for marker in RETRYABLE_ERROR_MARKERS)
 
+    def _content_failure(self, result: ToolMessage | Command) -> str | None:
+        """Return the failure text when a tool reports an upstream 429/5xx as output."""
+        if not isinstance(result, ToolMessage):
+            return None
+
+        content = result.content
+        if isinstance(content, list):
+            content = "".join(
+                block if isinstance(block, str) else str(block.get("text", ""))
+                for block in content
+                if isinstance(block, (str, dict))
+            )
+        text = str(content).strip()
+        if CONTENT_FAILURE_PATTERN.match(text):
+            return text
+        return None
+
     def _tool_message(
         self,
         request: ToolCallRequest,
@@ -104,18 +131,22 @@ class ToolRetryMiddleware(AgentMiddleware[AgentState]):
     def _final_error_content(
         self,
         request: ToolCallRequest,
-        error: Exception,
+        error: Exception | str,
+        attempts: int | None = None,
     ) -> str:
         tool_name = self._tool_name(request)
+        details = error if isinstance(error, str) else self._error_text(error)
         payload: dict[str, Any] = {
             "error": "Tool unavailable",
-            "message": f"{tool_name} failed after {self.max_attempts} attempts.",
+            "message": (
+                f"{tool_name} failed after {attempts or self.max_attempts} attempts."
+            ),
             "tool": tool_name,
             "suggestion": (
                 "Try a narrower or related query, use another available source, "
                 "or answer from already retrieved context."
             ),
-            "details": self._error_text(error)[:160],
+            "details": details[:160],
         }
         return json.dumps(payload)
 
@@ -125,10 +156,11 @@ class ToolRetryMiddleware(AgentMiddleware[AgentState]):
         handler,
     ) -> ToolMessage | Command:
         last_error: Exception | None = None
+        content_failures = 0
 
         for attempt in range(1, self.max_attempts + 1):
             try:
-                return await handler(request)
+                result = await handler(request)
             except Exception as error:
                 last_error = error
                 tool_name = self._tool_name(request)
@@ -166,6 +198,40 @@ class ToolRetryMiddleware(AgentMiddleware[AgentState]):
                     request,
                     self._final_error_content(request, error),
                 )
+
+            failure = self._content_failure(result)
+            if failure is None:
+                return result
+
+            content_failures += 1
+            tool_name = self._tool_name(request)
+            if (
+                content_failures < CONTENT_FAILURE_MAX_ATTEMPTS
+                and attempt < self.max_attempts
+            ):
+                delay = self.initial_delay * (self.backoff_factor ** (attempt - 1))
+                logger.warning(
+                    "Tool %s reported upstream failure on attempt %s/%s: %s; "
+                    "retrying in %.2fs",
+                    tool_name,
+                    attempt,
+                    self.max_attempts,
+                    failure[:160],
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            logger.warning(
+                "Tool %s reported upstream failure after %s attempts: %s",
+                tool_name,
+                attempt,
+                failure[:160],
+            )
+            return self._tool_message(
+                request,
+                self._final_error_content(request, failure, attempts=attempt),
+            )
 
         # Defensive fallback; loop should always return on success or final error.
         assert last_error is not None
