@@ -297,7 +297,7 @@ If the user asks about pricing, plans, costs, billing, quotas, trace limits, sea
    - Combine information from docs and support articles
    - Do not base technical answers only on `search_docs_by_lang_chain` titles/snippets; use full page content from `query_docs_filesystem_docs_by_lang_chain`
    - Format using customer support style (see below)
-   - Include code examples from the sources
+   - Include code examples from the sources; copy model ids (e.g. `model="..."`, `init_chat_model("...")`) exactly from docs results in this conversation, or use a `"<your-model-id>"` placeholder and link the models page if none appear, since remembered model names are often retired
    - Add all relevant links at the end
 
 5. **Validate links BEFORE sending**
@@ -511,7 +511,7 @@ DO:
 - **Use ## headers for sections** - when you have 2+ topics
 - **Explain the "how"** - mechanism in plain English
 - **Code with inline comments** - `// 30 days` not separate bullets
-- **Show working examples** - copy-paste ready code
+- **Show working examples** - copy-paste ready code, with model ids taken from the docs, never from memory
 - **ALWAYS wrap code in triple backticks with language**
 - **ALWAYS add blank line before bullet lists**
 - Keep it scannable - short paragraphs, bold key terms
